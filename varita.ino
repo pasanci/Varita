@@ -1,6 +1,7 @@
 #include <Wire.h>
 // WiFi for ESP8266 boards
 #include <ESP8266WiFi.h>
+#include "mqtt_helpers.h"
 
 // MPU6050 Slave Device Address
 const uint8_t MPU6050SlaveAddress = 0x68;
@@ -53,12 +54,15 @@ void setup() {
     Serial.print('.');
     delay(200);
   }
+  setup_mqtt();
 }
 
 bool offsets_set = false;
 
 double g0x = 0.0, g0y = 0.0, g0z = 0.0;
 bool gravity_set = false;
+
+volatile int mqtt_ident_pending = -1;
 
 void loop() {
   double Ax, Ay, Az, T, Gx, Gy, Gz;
@@ -163,8 +167,16 @@ void loop() {
       Serial.print(imu_buffer_index);
       Serial.println(" samples");
       // Send buffered IMU data as a CSV block over TCP to a host
-      send_buffer_over_tcp(imu_buffer, imu_buffer_index);
+      int ident = send_buffer_over_tcp(imu_buffer, imu_buffer_index);
+      if (ident >= 0) {
+        mqtt_ident_pending = ident;
+      }
       imu_buffer_index = 0;
+      // Non-blocking MQTT send
+      if (mqtt_ident_pending >= 0) {
+        send_mqtt_identified(mqtt_ident_pending);
+        mqtt_ident_pending = -1;
+      }
     }
   }
 
@@ -208,20 +220,20 @@ void MPU6050_Init(){
 }
 
 // Configuration for TCP destination (set these before uploading)
-const char* TCP_SERVER_IP = "192.168.0.100"; // change to host IP
+const char* TCP_SERVER_IP = "192.168.0.146"; // change to host IP
 const uint16_t TCP_SERVER_PORT = 5005;
 
 // Connect and send the buffered IMU data as CSV lines
-void send_buffer_over_tcp(IMUData *buffer, uint16_t count) {
+int send_buffer_over_tcp(IMUData *buffer, uint16_t count) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected, skip send");
-    return;
+    return -1;
   }
   WiFiClient client;
   if (!client.connect(TCP_SERVER_IP, TCP_SERVER_PORT)) {
     Serial.println("TCP connect failed");
     client.stop();
-    return;
+    return -1;
   }
   // Send header with number of samples
   client.print("MOVEMENT_START,");
@@ -236,5 +248,28 @@ void send_buffer_over_tcp(IMUData *buffer, uint16_t count) {
     yield();
   }
   client.println("MOVEMENT_END");
+
+  // Wait for response from server (identified integer or -1)
+  unsigned long start = millis();
+  String response = "";
+  while (client.connected() && millis() - start < 2000) { // 2s timeout
+    while (client.available()) {
+      char c = client.read();
+      if (c == '\n' || c == '\r') {
+        if (response.length() > 0) break;
+      } else {
+        response += c;
+      }
+    }
+    if (response.length() > 0) break;
+    delay(10);
+  }
   client.stop();
+  int ident = -1;
+  if (response.length() > 0) {
+    ident = response.toInt();
+  }
+  Serial.print("Identification result: ");
+  Serial.println(ident);
+  return ident;
 }

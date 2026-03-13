@@ -18,6 +18,14 @@ import os
 import joblib
 import numpy as np
 from features import extract_features
+LABEL_STRINGS = {
+    '0': 'Unknown',
+    '1': 'Circulo',
+    '2': 'Arriba Abajo',
+    '3': 'Lumos',
+    '4': 'Z',
+    # Add or edit mappings as needed
+}
 # Monkeypatch numpy deprecated aliases used by older sklearn versions
 try:
     import numpy as _np
@@ -91,6 +99,7 @@ class IMUHandler(socketserver.StreamRequestHandler):
                             except Exception as e:
                                 print(f"Failed to load model: {e}")
                                 model = None
+                        ident_result = -1
                         if model is not None:
                             feats = extract_features(buf)
                             if feats:
@@ -98,21 +107,43 @@ class IMUHandler(socketserver.StreamRequestHandler):
                                 try:
                                     pred = model.predict(X)[0]
                                     prob = None
+                                    idx = -1
                                     if hasattr(model, 'predict_proba'):
                                         p = model.predict_proba(X)
                                         # probability for predicted class
                                         idx = list(model.classes_).index(pred)
                                         prob = p[0, idx]
+                                    threshold = 0.4
+                                    label_str = LABEL_STRINGS.get(str(pred), str(pred))
                                     if prob is not None:
-                                        print(f"[{addr}] IDENTIFIED => {pred} (p={prob:.3f})")
+                                        if idx > 0 and prob > threshold:
+                                            print(f"[{addr}] IDENTIFIED => {idx} , {label_str} (p={prob:.3f})")
+                                            ident_result = idx
+                                        else:
+                                            print(f"[{addr}] UNKNOWN => {idx} (p={prob:.3f} < {threshold})")
+                                            ident_result = -1
                                     else:
-                                        print(f"[{addr}] IDENTIFIED => {pred}")
+                                        print(f"[{addr}] IDENTIFIED => {label_str}")
+                                        # If no probability, still send pred as int if possible
+                                        try:
+                                            ident_result = int(pred)
+                                        except Exception:
+                                            ident_result = -1
                                 except Exception as e:
                                     print(f"Classification error: {e}")
+                                    ident_result = -1
                             else:
                                 print(f"[{addr}] No features extracted; cannot classify")
+                                ident_result = -1
                         else:
                             print(f"[{addr}] No model available; cannot classify")
+                            ident_result = -1
+                        # Send result to client
+                        try:
+                            self.wfile.write(f"{ident_result}\n".encode('utf-8'))
+                            self.wfile.flush()
+                        except Exception as e:
+                            print(f"Failed to send identification result: {e}")
                     else:
                         print(f"[{addr}] Movement received but not saved (mode={mode})")
                 else:
@@ -182,8 +213,8 @@ def run(host, port, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     server = ThreadedTCPServer((host, port), IMUHandler)
     server.out_dir = out_dir
-    # operational state: default to training mode with label '0' (state 0)
-    server.mode = 'training'
+    # operational state: default to identifying mode with label '0' (state 0)
+    server.mode = 'identifying'
     server.label = '0'
     # model loading state for identifying mode
     server.model = None
