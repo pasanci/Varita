@@ -3,12 +3,79 @@
 #include <ESP8266WiFi.h>
 #include "mqtt_helpers.h"
 
+//Base resistor: Rb = 560 Ω (5V)
+//S8050
+//LED series resistor Red 47 Ω
+//LED series resistor Green 22 Ω
+//LED series resistor Blue 22 Ω
+//Wiring (one transistor per color): emitter → GND, collector → LED cathode, LED anode → Vcc through its series resistor, base → MCU pin via base resistor.
+
+
 // MPU6050 Slave Device Address
 const uint8_t MPU6050SlaveAddress = 0x68;
 
 // Select SDA and SCL pins for I2C communication 
 const uint8_t scl = D6;
 const uint8_t sda = D7;
+
+// --- RGB LED configuration (change pins if your wiring differs) ---
+// Recommended: use series resistors per channel (see notes below)
+const uint8_t PIN_R = D1; // red channel pin
+const uint8_t PIN_G = D2; // green channel pin
+const uint8_t PIN_B = D5; // blue channel pin
+// If your LED is common-anode (anode to 3.3V), set to true to invert PWM values
+const bool COMMON_ANODE = true;
+// If you're driving each cathode through an NPN low-side transistor (e.g. S8050),
+// set this to true so PWM is driven to the transistor base (HIGH = ON).
+// If false, PWM drives the LED cathode directly (LOW = ON for common-anode).
+const bool TRANSISTOR_LOW_SIDE = true;
+
+// Overall and per-channel scaling to balance perceived brightness.
+// Tweak these to reduce green dominance. Range 0.0..1.0
+const float BRIGHTNESS_SCALE = 1.00; // master brightness (0-1)
+const float CHANNEL_SCALE_R = 1.00;  // red multiplier
+const float CHANNEL_SCALE_G = 1.00;  // green multiplier (adjusted to restore pink)
+const float CHANNEL_SCALE_B = 1.00;  // blue multiplier
+
+// forward declarations
+void setRGB(uint8_t r, uint8_t g, uint8_t b);
+void setPink();
+// raw writer and test helper
+void setRawRGB(uint8_t r, uint8_t g, uint8_t b);
+void runColorCycleTest();
+// Breathing effect configuration
+const bool BREATHING_ENABLED = true;
+const unsigned long BREATHING_PERIOD_MS = 3000; // full breathe cycle (ms)
+const float BREATH_MIN = 0.00; // minimum brightness multiplier (0..1)
+const float BREATH_MAX = 1.00; // maximum brightness multiplier (0..1)
+// Debug prints for breathing calculations
+const bool DEBUG_BREATHING = true;
+
+// Base pink color (used for breathing)
+// Tuned to a balanced rosy pink (reduce extreme red)
+const uint8_t PINK_R = 190;
+const uint8_t PINK_G = 185;
+const uint8_t PINK_B = 210;
+
+// Base white color (used for breathing)
+// Tuned to a balanced rosy pink (reduce extreme red)
+const uint8_t WHITE_R = 145;
+const uint8_t WHITE_G = 200;
+const uint8_t WHITE_B = 255;
+
+// forward declaration for breathing updater
+void updateBreathing();
+// runtime control for breathing (allow temporarily disabling breathing)
+bool breathing_runtime_enabled = false;
+// runtime movement flag accessible by breathing logic
+bool device_moving = false;
+// Dimming-on-stop runtime state
+bool dimming_active = true;
+unsigned long dim_start_ms = 0;
+unsigned long dim_duration_ms = 0;
+// forward declarations for dimming
+void startMaxPinkDim(unsigned long fade_ms);
+void updateDimming();
 
 // sensitivity scale factor respective to full scale setting provided in datasheet 
 // Buffer configuration
@@ -44,17 +111,102 @@ int16_t AccelX, AccelY, AccelZ, Temperature, GyroX, GyroY, GyroZ;
 
 void setup() {
   Serial.begin(115200);
+  // short delay to let USB-serial settle and avoid early garbled output
+  delay(100);
+  // Disable ESP core debug output which can produce unreadable lines on Serial
+  Serial.setDebugOutput(false);
+  Serial.println("\n== varita starting ==");
   Wire.begin(sda, scl);
   MPU6050_Init();
+  // initialize RGB so we can pulse while waiting for WiFi
+  // initialize RGB removed to prevent high startup current during flashing
+  // analogWriteRange(255);
+  // pinMode(PIN_R, OUTPUT);
+  // pinMode(PIN_G, OUTPUT);
+  // pinMode(PIN_B, OUTPUT);
+  // start with LED off by default
+  // setRGB(0, 0, 0);
+  randomSeed(analogRead(A0));
+  // quick color test disabled
+  // runColorCycleTest();
+
   // connect to WiFi (configure SSID/PASS below)
   WiFi.mode(WIFI_STA);
   WiFi.begin("SKPT_2G", "04skypet30");
   unsigned long wifi_start = millis();
+  // Pulse random colors (with breathing) while waiting for WiFi
+  const unsigned long colorChangeMs = 1000; // transition duration between colors
+  const unsigned long breathPeriod = 1500;
+  unsigned long colorStartMs = millis();
+  uint8_t colorFromR = random(256), colorFromG = random(256), colorFromB = random(256);
+  uint8_t colorToR = random(256), colorToG = random(256), colorToB = random(256);
   while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
-    Serial.print('.');
-    delay(200);
+    unsigned long now = millis();
+    unsigned long elapsedColor = now - colorStartMs;
+    float mix = (colorChangeMs > 0) ? (float)elapsedColor / (float)colorChangeMs : 1.0f;
+    if (mix >= 1.0f) {
+      // advance to next target
+      colorFromR = colorToR; colorFromG = colorToG; colorFromB = colorToB;
+      colorToR = random(256); colorToG = random(256); colorToB = random(256);
+      colorStartMs = now;
+      mix = 0.0f;
+    }
+    // eased mix for smooth ease-in-out transition
+    float mixEased = 0.5f - 0.5f * cosf(constrain(mix, 0.0f, 1.0f) * PI);
+    uint8_t baseR = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromR + mixEased * (float)colorToR);
+    uint8_t baseG = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromG + mixEased * (float)colorToG);
+    uint8_t baseB = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromB + mixEased * (float)colorToB);
+
+    // breathing envelope
+    unsigned long t = (now - wifi_start) % breathPeriod;
+    float phase = (float)t / (float)breathPeriod;
+    float v = sinf(phase * 2.0f * PI - PI/2.0f);
+    float norm = (v + 1.0f) * 0.5f;
+    uint8_t r = (uint8_t)roundf((float)baseR * norm);
+    uint8_t g = (uint8_t)roundf((float)baseG * norm);
+    uint8_t b = (uint8_t)roundf((float)baseB * norm);
+    setRGB(r, g, b);
+    delay(25);
+    yield();
   }
+  // ensure LED off before continuing
+  setRGB(0,0,0);
   setup_mqtt();
+  Serial.println("\n== varita started ==");
+}
+
+// Start a non-blocking dim sequence: set pink at max then fade to off
+void startMaxPinkDim(unsigned long fade_ms) {
+  dimming_active = true;
+  dim_start_ms = millis();
+  dim_duration_ms = fade_ms;
+  // stop breathing while dimming
+  breathing_runtime_enabled = false;
+  // set to max pink immediately (use scaled path so channel balancing/inversion applies)
+  setRGB(PINK_R, PINK_G, PINK_B);
+}
+
+// Call frequently from loop(); will update dimming state and re-enable breathing
+void updateDimming() {
+  if (!dimming_active) return;
+  unsigned long now = millis();
+  unsigned long elapsed = now - dim_start_ms;
+  if (elapsed >= dim_duration_ms) {
+    // finished fading — re-enable breathing and stop dimming
+    dimming_active = false;
+    breathing_runtime_enabled = true;
+    // ensure LED fully off at end of fade (use scaled path for consistent inversion/brightness)
+    setRGB(0, 0, 0);
+    return;
+  }
+  float t = (float)elapsed / (float)dim_duration_ms; // 0..1
+  // linear fade (1 -> 0). Could use easing if desired.
+  float brightness = 1.0f - t;
+  if (brightness < 0.0f) brightness = 0.0f;
+  uint8_t r = (uint8_t)roundf((float)PINK_R * brightness);
+  uint8_t g = (uint8_t)roundf((float)PINK_G * brightness);
+  uint8_t b = (uint8_t)roundf((float)PINK_B * brightness);
+  setRawRGB(r, g, b);
 }
 
 bool offsets_set = false;
@@ -141,6 +293,12 @@ void loop() {
       Serial.println("movement started");
       imu_buffer_index = 0;
       buffer_filled = false;
+    // If a dimming sequence was running, cancel it and keep LED off
+    if (dimming_active) {
+      dimming_active = false;
+      breathing_runtime_enabled = false;
+      setRGB(0, 0, 0);
+    }
     }
     if (gyro_strength > max_gyro_strength) max_gyro_strength = gyro_strength;
     if (gyro_strength < min_gyro_strength) min_gyro_strength = gyro_strength;
@@ -177,9 +335,120 @@ void loop() {
         send_mqtt_identified(mqtt_ident_pending);
         mqtt_ident_pending = -1;
       }
+      // Start the max-brightness-then-dim sequence (4s fade by default)
+      startMaxPinkDim(4000);
     }
   }
+  // update breathing animation (non-blocking)
+  // inform breathing logic whether we're currently moving
+  device_moving = moving;
+  updateBreathing();
+  // update dimming (non-blocking)
+  updateDimming();
+}
 
+// Set RGB (0-255 per channel). Applies master brightness and per-channel
+// scaling to balance perceived brightness, then inverts for common-anode.
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  // apply float scaling
+  int r_scaled = (int)roundf((float)r * BRIGHTNESS_SCALE * CHANNEL_SCALE_R);
+  int g_scaled = (int)roundf((float)g * BRIGHTNESS_SCALE * CHANNEL_SCALE_G);
+  int b_scaled = (int)roundf((float)b * BRIGHTNESS_SCALE * CHANNEL_SCALE_B);
+  // clamp
+  if (r_scaled < 0) r_scaled = 0; if (r_scaled > 255) r_scaled = 255;
+  if (g_scaled < 0) g_scaled = 0; if (g_scaled > 255) g_scaled = 255;
+  if (b_scaled < 0) b_scaled = 0; if (b_scaled > 255) b_scaled = 255;
+
+  uint8_t out_r = (uint8_t)r_scaled;
+  uint8_t out_g = (uint8_t)g_scaled;
+  uint8_t out_b = (uint8_t)b_scaled;
+
+  // For common-anode LEDs we normally invert PWM because the MCU sinks current
+  // (LOW = ON). However when using NPN low-side transistors the MCU drives
+  // the transistor base and HIGH must turn the transistor ON. In that case
+  // do not invert the PWM values.
+  if (COMMON_ANODE && !TRANSISTOR_LOW_SIDE) {
+    out_r = 255 - out_r;
+    out_g = 255 - out_g;
+    out_b = 255 - out_b;
+  }
+
+  analogWrite(PIN_R, out_r);
+  analogWrite(PIN_G, out_g);
+  analogWrite(PIN_B, out_b);
+}
+
+// Raw output (no brightness/channel scaling)
+void setRawRGB(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t out_r = r;
+  uint8_t out_g = g;
+  uint8_t out_b = b;
+  if (COMMON_ANODE && !TRANSISTOR_LOW_SIDE) {
+    out_r = 255 - out_r;
+    out_g = 255 - out_g;
+    out_b = 255 - out_b;
+  }
+  analogWrite(PIN_R, out_r);
+  analogWrite(PIN_G, out_g);
+  analogWrite(PIN_B, out_b);
+}
+
+// Quick raw color cycle to verify each channel; uses setRawRGB so scaling
+// and brightness adjustments don't affect the test.
+void runColorCycleTest() {
+  setRawRGB(255, 0, 0); delay(800);
+  setRawRGB(0, 255, 0); delay(800);
+  setRawRGB(0, 0, 255); delay(800);
+  setRawRGB(255, 255, 255); delay(800);
+  setRawRGB(PINK_R, PINK_G, PINK_B); delay(1200);
+  setRawRGB(0, 0, 0); delay(500);
+}
+
+// Light a pleasant light-pink tone. Adjust RGB values if needed.
+void setPink() {
+  // Light pink: R=255, G=182, B=193 (values 0-255)
+  setRGB(PINK_R, PINK_G, PINK_B);
+}
+
+// Non-blocking breathing update; call frequently from loop()
+void updateBreathing() {
+  Serial.println("updateBreathing called");
+  if (!BREATHING_ENABLED || !breathing_runtime_enabled) return;
+  Serial.println("pasa");
+  // don't run breathing animation while device is moving
+  if (device_moving) return;
+  static unsigned long last_update = 0;
+  const unsigned long min_interval = 20; // update at most ~50Hz
+  unsigned long now = millis();
+  if (now - last_update < min_interval) return;
+  last_update = now;
+
+  // compute phase [0..1)
+  unsigned long t = now % BREATHING_PERIOD_MS;
+  float phase = (float)t / (float)BREATHING_PERIOD_MS;
+  // use a sine wave for smooth breathing: map sin(-pi/2..3pi/2) -> 0..1
+  float v = sinf(phase * 2.0f * PI - PI/2.0f);
+  float norm = (v + 1.0f) * 0.5f; // 0..1
+  // scale between min and max
+  float breath = BREATH_MIN + (BREATH_MAX - BREATH_MIN) * norm;
+
+  // apply breathing to base pink and set
+  uint8_t r = (uint8_t)roundf((float)WHITE_R * breath);
+  uint8_t g = (uint8_t)roundf((float)WHITE_G * breath);
+  uint8_t b = (uint8_t)roundf((float)WHITE_B * breath);
+  setRGB(r, g, b);
+
+  if (DEBUG_BREATHING) {
+    static unsigned long last_dbg = 0;
+    unsigned long now_dbg = millis();
+    if (now_dbg - last_dbg >= 500) {
+      last_dbg = now_dbg;
+      // print raw breath (0..1) and the scaled outputs after setRGB's scaling
+      int r_scaled = (int)roundf((float)r * BRIGHTNESS_SCALE * CHANNEL_SCALE_R);
+      int g_scaled = (int)roundf((float)g * BRIGHTNESS_SCALE * CHANNEL_SCALE_G);
+      int b_scaled = (int)roundf((float)b * BRIGHTNESS_SCALE * CHANNEL_SCALE_B);
+    }
+  }
 }
 
 void I2C_Write(uint8_t deviceAddress, uint8_t regAddress, uint8_t data){
@@ -206,9 +475,16 @@ void Read_RawValue(uint8_t deviceAddress, uint8_t regAddress){
 
 //configure MPU6050
 void MPU6050_Init(){
+  // Give sensor time to power up
   delay(150);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SMPLRT_DIV, 0x07);
+  // Soft reset the MPU6050 to ensure known state after uploads/resets
+  // Set DEVICE_RESET bit (bit 7) in PWR_MGMT_1
+  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_1, 0x80);
+  delay(100);
+  // Clear reset and select clock source (auto select X gyro) and wake up
   I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_1, 0x01);
+  // sample rate divider
+  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SMPLRT_DIV, 0x07);
   I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_2, 0x00);
   I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_CONFIG, 0x00);
   I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_GYRO_CONFIG, 0x00);//set +/-250 degree/second full scale
