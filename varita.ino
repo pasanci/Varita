@@ -1,28 +1,32 @@
 #include <Wire.h>
-// WiFi for ESP8266 boards
-#include <ESP8266WiFi.h>
-#include "mqtt_helpers.h"
+// Modified for XIAO nRF52840 Sense Plus: no ESP8266 WiFi
+// If you need network features on the XIAO use BLE or add an external
+// radio/bridge. The ESP8266 WiFi include is intentionally disabled.
+// #include <ESP8266WiFi.h>
+// #include "mqtt_helpers.h"
 
-//Base resistor: Rb = 560 Ω (5V)
-//S8050
-//LED series resistor Red 47 Ω
-//LED series resistor Green 22 Ω
-//LED series resistor Blue 22 Ω
+//Base resistor: Rb = 1 kΩ (3.3V)
+//S8050 E B C pinout: https://www.eleccircuit.com/wp-content/uploads/2018/05/S8050-Transistor-Pinout.png
+//LED series resistor Red 68 Ω
+//LED series resistor Green 47 Ω
+//LED series resistor Blue 3.3 Ω
 //Wiring (one transistor per color): emitter → GND, collector → LED cathode, LED anode → Vcc through its series resistor, base → MCU pin via base resistor.
 
 
 // MPU6050 Slave Device Address
-const uint8_t MPU6050SlaveAddress = 0x68;
+// Use the XIAO's onboard IMU. Prefer the LSM6DS3 library header.
+#include <LSM6DS3.h>
+LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
 
-// Select SDA and SCL pins for I2C communication 
-const uint8_t scl = D6;
-const uint8_t sda = D7;
+// On XIAO the default I2C pins are used; no manual SDA/SCL selection here.
 
 // --- RGB LED configuration (change pins if your wiring differs) ---
 // Recommended: use series resistors per channel (see notes below)
-const uint8_t PIN_R = D1; // red channel pin
-const uint8_t PIN_G = D2; // green channel pin
-const uint8_t PIN_B = D5; // blue channel pin
+// Update these to match how you wired the RGB LED to the XIAO.
+// Example defaults (change if needed):
+const uint8_t PIN_R = 0; // red channel pin
+const uint8_t PIN_G = 2; // green channel pin
+const uint8_t PIN_B = 3; // blue channel pin
 // If your LED is common-anode (anode to 3.3V), set to true to invert PWM values
 const bool COMMON_ANODE = true;
 // If you're driving each cathode through an NPN low-side transistor (e.g. S8050),
@@ -36,6 +40,9 @@ const float BRIGHTNESS_SCALE = 1.00; // master brightness (0-1)
 const float CHANNEL_SCALE_R = 1.00;  // red multiplier
 const float CHANNEL_SCALE_G = 1.00;  // green multiplier (adjusted to restore pink)
 const float CHANNEL_SCALE_B = 1.00;  // blue multiplier
+
+// Enable/disable IMU (set false to skip I2C/init for wiring tests)
+const bool IMU_ENABLED = true;
 
 // forward declarations
 void setRGB(uint8_t r, uint8_t g, uint8_t b);
@@ -53,14 +60,14 @@ const bool DEBUG_BREATHING = true;
 
 // Base pink color (used for breathing)
 // Tuned to a balanced rosy pink (reduce extreme red)
-const uint8_t PINK_R = 190;
-const uint8_t PINK_G = 185;
-const uint8_t PINK_B = 210;
+const uint8_t PINK_R = 255;
+const uint8_t PINK_G = 20;
+const uint8_t PINK_B = 80;
 
 // Base white color (used for breathing)
 // Tuned to a balanced rosy pink (reduce extreme red)
-const uint8_t WHITE_R = 145;
-const uint8_t WHITE_G = 200;
+const uint8_t WHITE_R = 165;
+const uint8_t WHITE_G = 225;
 const uint8_t WHITE_B = 255;
 
 // forward declaration for breathing updater
@@ -94,18 +101,9 @@ volatile bool buffer_filled = false;
 const uint16_t AccelScaleFactor = 16384;
 const uint16_t GyroScaleFactor = 131;
 
-// MPU6050 few configuration register addresses
-const uint8_t MPU6050_REGISTER_SMPLRT_DIV   =  0x19;
-const uint8_t MPU6050_REGISTER_USER_CTRL    =  0x6A;
-const uint8_t MPU6050_REGISTER_PWR_MGMT_1   =  0x6B;
-const uint8_t MPU6050_REGISTER_PWR_MGMT_2   =  0x6C;
-const uint8_t MPU6050_REGISTER_CONFIG       =  0x1A;
-const uint8_t MPU6050_REGISTER_GYRO_CONFIG  =  0x1B;
-const uint8_t MPU6050_REGISTER_ACCEL_CONFIG =  0x1C;
-const uint8_t MPU6050_REGISTER_FIFO_EN      =  0x23;
-const uint8_t MPU6050_REGISTER_INT_ENABLE   =  0x38;
-const uint8_t MPU6050_REGISTER_ACCEL_XOUT_H =  0x3B;
-const uint8_t MPU6050_REGISTER_SIGNAL_PATH_RESET  = 0x68;
+// Debug: print IMU samples to serial (CSV). Set to false to disable.
+const bool DEBUG_IMU = false;
+const unsigned long IMU_PRINT_MS = 100; // print interval (ms)
 
 int16_t AccelX, AccelY, AccelZ, Temperature, GyroX, GyroY, GyroZ;
 
@@ -113,65 +111,28 @@ void setup() {
   Serial.begin(115200);
   // short delay to let USB-serial settle and avoid early garbled output
   delay(100);
-  // Disable ESP core debug output which can produce unreadable lines on Serial
-  Serial.setDebugOutput(false);
   Serial.println("\n== varita starting ==");
-  Wire.begin(sda, scl);
-  MPU6050_Init();
+  // Use default I2C pins on XIAO (guarded for test)
+  if (IMU_ENABLED) {
+    Wire.begin();
+    MPU6050_Init();
+  } else {
+    Serial.println("IMU init disabled for test");
+  }
   // initialize RGB so we can pulse while waiting for WiFi
   // initialize RGB removed to prevent high startup current during flashing
   // analogWriteRange(255);
-  // pinMode(PIN_R, OUTPUT);
-  // pinMode(PIN_G, OUTPUT);
-  // pinMode(PIN_B, OUTPUT);
+  pinMode(PIN_R, OUTPUT);
+  pinMode(PIN_G, OUTPUT);
+  pinMode(PIN_B, OUTPUT);
   // start with LED off by default
-  // setRGB(0, 0, 0);
-  randomSeed(analogRead(A0));
+  setRGB(0, 0, 0);
+  //randomSeed(analogRead(A0));
   // quick color test disabled
   // runColorCycleTest();
 
-  // connect to WiFi (configure SSID/PASS below)
-  WiFi.mode(WIFI_STA);
-  WiFi.begin("SKPT_2G", "04skypet30");
-  unsigned long wifi_start = millis();
-  // Pulse random colors (with breathing) while waiting for WiFi
-  const unsigned long colorChangeMs = 1000; // transition duration between colors
-  const unsigned long breathPeriod = 1500;
-  unsigned long colorStartMs = millis();
-  uint8_t colorFromR = random(256), colorFromG = random(256), colorFromB = random(256);
-  uint8_t colorToR = random(256), colorToG = random(256), colorToB = random(256);
-  while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
-    unsigned long now = millis();
-    unsigned long elapsedColor = now - colorStartMs;
-    float mix = (colorChangeMs > 0) ? (float)elapsedColor / (float)colorChangeMs : 1.0f;
-    if (mix >= 1.0f) {
-      // advance to next target
-      colorFromR = colorToR; colorFromG = colorToG; colorFromB = colorToB;
-      colorToR = random(256); colorToG = random(256); colorToB = random(256);
-      colorStartMs = now;
-      mix = 0.0f;
-    }
-    // eased mix for smooth ease-in-out transition
-    float mixEased = 0.5f - 0.5f * cosf(constrain(mix, 0.0f, 1.0f) * PI);
-    uint8_t baseR = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromR + mixEased * (float)colorToR);
-    uint8_t baseG = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromG + mixEased * (float)colorToG);
-    uint8_t baseB = (uint8_t)roundf((1.0f - mixEased) * (float)colorFromB + mixEased * (float)colorToB);
-
-    // breathing envelope
-    unsigned long t = (now - wifi_start) % breathPeriod;
-    float phase = (float)t / (float)breathPeriod;
-    float v = sinf(phase * 2.0f * PI - PI/2.0f);
-    float norm = (v + 1.0f) * 0.5f;
-    uint8_t r = (uint8_t)roundf((float)baseR * norm);
-    uint8_t g = (uint8_t)roundf((float)baseG * norm);
-    uint8_t b = (uint8_t)roundf((float)baseB * norm);
-    setRGB(r, g, b);
-    delay(25);
-    yield();
-  }
-  // ensure LED off before continuing
-  setRGB(0,0,0);
-  setup_mqtt();
+  // No WiFi on XIAO by default; run a short startup color check instead.
+  runColorCycleTest();
   Serial.println("\n== varita started ==");
 }
 
@@ -217,8 +178,11 @@ bool gravity_set = false;
 volatile int mqtt_ident_pending = -1;
 
 void loop() {
+  analogWrite(4, 0);
   double Ax, Ay, Az, T, Gx, Gy, Gz;
-  Read_RawValue(MPU6050SlaveAddress, MPU6050_REGISTER_ACCEL_XOUT_H);
+  if (IMU_ENABLED) {
+    Read_RawValue();
+  }
   // Divide each with their sensitivity scale factor
   Ax = (double)AccelX/AccelScaleFactor;
   Ay = (double)AccelY/AccelScaleFactor;
@@ -227,6 +191,22 @@ void loop() {
   Gx = (double)GyroX/GyroScaleFactor;
   Gy = (double)GyroY/GyroScaleFactor;
   Gz = (double)GyroZ/GyroScaleFactor;
+
+  // Optional: print IMU values to Serial (human- or CSV-friendly)
+  if (DEBUG_IMU) {
+    static unsigned long last_imu_print = 0;
+    unsigned long now = millis();
+    if (now - last_imu_print >= IMU_PRINT_MS) {
+      last_imu_print = now;
+      // CSV: Ax,Ay,Az,Gx,Gy,Gz
+      Serial.print(Ax, 4); Serial.print(',');
+      Serial.print(Ay, 4); Serial.print(',');
+      Serial.print(Az, 4); Serial.print(',');
+      Serial.print(Gx, 4); Serial.print(',');
+      Serial.print(Gy, 4); Serial.print(',');
+      Serial.println(Gz, 4);
+    }
+  }
 
 
   // Calculate movement strength (vector magnitude)
@@ -293,12 +273,12 @@ void loop() {
       Serial.println("movement started");
       imu_buffer_index = 0;
       buffer_filled = false;
-    // If a dimming sequence was running, cancel it and keep LED off
-    if (dimming_active) {
-      dimming_active = false;
-      breathing_runtime_enabled = false;
-      setRGB(0, 0, 0);
-    }
+      // If a dimming sequence was running, cancel it and keep LED off
+      if (dimming_active) {
+        dimming_active = false;
+        breathing_runtime_enabled = false;
+        setRGB(0, 0, 0);
+      }
     }
     if (gyro_strength > max_gyro_strength) max_gyro_strength = gyro_strength;
     if (gyro_strength < min_gyro_strength) min_gyro_strength = gyro_strength;
@@ -339,11 +319,12 @@ void loop() {
       startMaxPinkDim(4000);
     }
   }
-  // update breathing animation (non-blocking)
+  // update breathing animation (replaced by RGB cycle for testing)
   // inform breathing logic whether we're currently moving
   device_moving = moving;
-  updateBreathing();
+  //cycleRGBAlternating();
   // update dimming (non-blocking)
+  updateBreathing();
   updateDimming();
 }
 
@@ -373,6 +354,10 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
     out_b = 255 - out_b;
   }
 
+  Serial.print("setRGB: ");
+  Serial.print(out_r); Serial.print(", ");
+  Serial.print(out_g); Serial.print(", ");
+  Serial.println(out_b);
   analogWrite(PIN_R, out_r);
   analogWrite(PIN_G, out_g);
   analogWrite(PIN_B, out_b);
@@ -388,6 +373,11 @@ void setRawRGB(uint8_t r, uint8_t g, uint8_t b) {
     out_g = 255 - out_g;
     out_b = 255 - out_b;
   }
+  Serial.print("setRawRGB: ");
+  Serial.print(out_r); Serial.print(", ");
+  Serial.print(out_g); Serial.print(", ");
+  Serial.println(out_b);
+
   analogWrite(PIN_R, out_r);
   analogWrite(PIN_G, out_g);
   analogWrite(PIN_B, out_b);
@@ -401,7 +391,7 @@ void runColorCycleTest() {
   setRawRGB(0, 0, 255); delay(800);
   setRawRGB(255, 255, 255); delay(800);
   setRawRGB(PINK_R, PINK_G, PINK_B); delay(1200);
-  setRawRGB(0, 0, 0); delay(500);
+  setRawRGB(0, 0, 0); delay(1500);
 }
 
 // Light a pleasant light-pink tone. Adjust RGB values if needed.
@@ -412,9 +402,7 @@ void setPink() {
 
 // Non-blocking breathing update; call frequently from loop()
 void updateBreathing() {
-  Serial.println("updateBreathing called");
   if (!BREATHING_ENABLED || !breathing_runtime_enabled) return;
-  Serial.println("pasa");
   // don't run breathing animation while device is moving
   if (device_moving) return;
   static unsigned long last_update = 0;
@@ -451,48 +439,75 @@ void updateBreathing() {
   }
 }
 
+// Alternate pure red, green, blue at full brightness for 1s each.
+void cycleRGBAlternating() {
+  static unsigned long last_change = 0;
+  static uint8_t state = 0; // 0=red,1=green,2=blue
+  unsigned long now = millis();
+  if (last_change == 0) {
+    last_change = now;
+    state = 0;
+    setRGB(255, 0, 0);
+    return;
+  }
+  if (now - last_change >= 5000) {
+    last_change = now;
+    state = (state + 1) % 3;
+    if (state == 0) setRGB(255, 0, 0);
+    else if (state == 1) setRGB(0, 255, 0);
+    else setRGB(0, 0, 255);
+  }
+}
+
 void I2C_Write(uint8_t deviceAddress, uint8_t regAddress, uint8_t data){
-  Wire.beginTransmission(deviceAddress);
-  Wire.write(regAddress);
-  Wire.write(data);
-  Wire.endTransmission();
+  // No-op for onboard IMU path (kept for API compatibility).
+  (void)deviceAddress; (void)regAddress; (void)data;
 }
 
 // read all 14 register
-void Read_RawValue(uint8_t deviceAddress, uint8_t regAddress){
-  Wire.beginTransmission(deviceAddress);
-  Wire.write(regAddress);
-  Wire.endTransmission();
-  Wire.requestFrom(deviceAddress, (uint8_t)14);
-  AccelX = (((int16_t)Wire.read()<<8) | Wire.read());
-  AccelY = (((int16_t)Wire.read()<<8) | Wire.read());
-  AccelZ = (((int16_t)Wire.read()<<8) | Wire.read());
-  Temperature = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroX = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroY = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroZ = (((int16_t)Wire.read()<<8) | Wire.read());
+void Read_RawValue(){
+  // Read from onboard IMU and convert to the same scaled integer representation
+  // used previously (AccelScaleFactor -> raw int16; GyroScaleFactor -> raw int16).
+  float ax_mss = 0.0f, ay_mss = 0.0f, az_mss = 0.0f;
+  float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps = 0.0f;
+
+  // If acceleration available, read it (m/s^2)
+  ax_mss = myIMU.readFloatAccelX();
+  ay_mss = myIMU.readFloatAccelY();
+  az_mss = myIMU.readFloatAccelZ();
+
+  gx_dps = myIMU.readFloatGyroX();
+  gy_dps = myIMU.readFloatGyroY();
+  gz_dps = myIMU.readFloatGyroZ();
+
+  // Convert acceleration m/s^2 -> g units then scale to int16 range used earlier
+  const float g_conv = 9.80665f;
+  float ax_g = ax_mss / g_conv;
+  float ay_g = ay_mss / g_conv;
+  float az_g = az_mss / g_conv;
+
+  AccelX = (int16_t)roundf(ax_g * (float)AccelScaleFactor);
+  AccelY = (int16_t)roundf(ay_g * (float)AccelScaleFactor);
+  AccelZ = (int16_t)roundf(az_g * (float)AccelScaleFactor);
+
+  // Gyroscope: assume IMU.readGyroscope returns deg/s; scale to previous factor
+  GyroX = (int16_t)roundf(gx_dps * (float)GyroScaleFactor);
+  GyroY = (int16_t)roundf(gy_dps * (float)GyroScaleFactor);
+  GyroZ = (int16_t)roundf(gz_dps * (float)GyroScaleFactor);
+  // Temperature not provided by onboard IMU here
+  Temperature = 0;
 }
 
 //configure MPU6050
 void MPU6050_Init(){
-  // Give sensor time to power up
+  // Initialize onboard IMU (LSM6DS3/LSM6DSOX via Arduino_LSM6DS3)
+  Serial.println("Initializing onboard IMU...");
   delay(150);
-  // Soft reset the MPU6050 to ensure known state after uploads/resets
-  // Set DEVICE_RESET bit (bit 7) in PWR_MGMT_1
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_1, 0x80);
-  delay(100);
-  // Clear reset and select clock source (auto select X gyro) and wake up
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_1, 0x01);
-  // sample rate divider
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SMPLRT_DIV, 0x07);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_2, 0x00);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_CONFIG, 0x00);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_GYRO_CONFIG, 0x00);//set +/-250 degree/second full scale
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_ACCEL_CONFIG, 0x00);// set +/- 2g full scale
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_FIFO_EN, 0x00);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_INT_ENABLE, 0x01);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SIGNAL_PATH_RESET, 0x00);
-  I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_USER_CTRL, 0x00);
+  if (!myIMU.begin()) {
+    Serial.println("Failed to initialize onboard IMU — check library/board");
+  } else {
+    Serial.println("Onboard IMU initialized");
+  }
 }
 
 // Configuration for TCP destination (set these before uploading)
@@ -501,51 +516,14 @@ const uint16_t TCP_SERVER_PORT = 5005;
 
 // Connect and send the buffered IMU data as CSV lines
 int send_buffer_over_tcp(IMUData *buffer, uint16_t count) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, skip send");
-    return -1;
-  }
-  WiFiClient client;
-  if (!client.connect(TCP_SERVER_IP, TCP_SERVER_PORT)) {
-    Serial.println("TCP connect failed");
-    client.stop();
-    return -1;
-  }
-  // Send header with number of samples
-  client.print("MOVEMENT_START,");
-  client.println(count);
-  for (uint16_t i = 0; i < count; i++) {
-    client.print(buffer[i].ax, 4); client.print(',');
-    client.print(buffer[i].ay, 4); client.print(',');
-    client.print(buffer[i].az, 4); client.print(',');
-    client.print(buffer[i].gx, 4); client.print(',');
-    client.print(buffer[i].gy, 4); client.print(',');
-    client.println(buffer[i].gz, 4);
-    yield();
-  }
-  client.println("MOVEMENT_END");
+  // Networking is not implemented for the XIAO build. Return -1.
+  Serial.println("send_buffer_over_tcp: network disabled on this build");
+  (void)buffer;
+  (void)count;
+  return -1;
+}
 
-  // Wait for response from server (identified integer or -1)
-  unsigned long start = millis();
-  String response = "";
-  while (client.connected() && millis() - start < 2000) { // 2s timeout
-    while (client.available()) {
-      char c = client.read();
-      if (c == '\n' || c == '\r') {
-        if (response.length() > 0) break;
-      } else {
-        response += c;
-      }
-    }
-    if (response.length() > 0) break;
-    delay(10);
-  }
-  client.stop();
-  int ident = -1;
-  if (response.length() > 0) {
-    ident = response.toInt();
-  }
-  Serial.print("Identification result: ");
-  Serial.println(ident);
-  return ident;
+// Stub for MQTT-identification handler when networking is disabled
+void send_mqtt_identified(int ident) {
+  (void)ident;
 }
